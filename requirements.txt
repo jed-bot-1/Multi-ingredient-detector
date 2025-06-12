@@ -1,8 +1,9 @@
 fastapi==0.115.0
 uvicorn==0.18.3
-gunicorn==21.2.0  # <-- Add this line
+gunicorn==21.2.0
 tensorflow==2.15.0
 pillow==9.4.0
 matplotlib==3.7.1
 keras==2.15.0
-python-multipart==0.0.6 
+python-multipart==0.0.6
+opencv-python==4.8.1.78  # <-- Adds cv2
