@@ -10,14 +10,17 @@ import os
 import psutil
 import logging
 
+# === 🛠️ FIX: Set YOLO config directory ===
+os.environ["YOLO_CONFIG_DIR"] = "/tmp"
+
 app = FastAPI()
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("detector")
 
-# Load YOLO ONNX model
-model = YOLO('best.onnx')
+# === 🛠️ FIX: Explicitly define task ===
+model = YOLO('best.onnx', task='detect')
 
 @app.post("/detect/")
 async def detect(file: UploadFile = File(...)):
@@ -87,7 +90,7 @@ async def detect(file: UploadFile = File(...)):
         mem = process.memory_info().rss / (1024 * 1024)
         logger.info(f"📉 Memory after cleanup: {mem:.2f} MB")
 
-        # Manually clear model cache (YOLO internally uses torch/onnxruntime)
+        # Clear model results
         try:
             model.model = None
             del results
