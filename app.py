@@ -10,24 +10,21 @@ import os
 import psutil
 import logging
 
-# === 🛠️ FIX: Set YOLO config directory ===
-os.environ["YOLO_CONFIG_DIR"] = "/tmp"
-
+# === CONFIG ===
+os.environ["YOLO_CONFIG_DIR"] = "/tmp"  # Prevent write issues on Render
 app = FastAPI()
-
-# Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("detector")
 
-# === 🛠️ FIX: Explicitly define task ===
+# === Load model only once ===
 model = YOLO('best.onnx', task='detect')
 
 @app.post("/detect/")
 async def detect(file: UploadFile = File(...)):
+    contents = None
     try:
         logger.info("⏳ Received image, starting detection...")
 
-        # Read uploaded image
         contents = await file.read()
         nparr = np.frombuffer(contents, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -36,65 +33,65 @@ async def detect(file: UploadFile = File(...)):
             logger.warning("🚫 Invalid image format.")
             return JSONResponse({"error": "Invalid image"}, status_code=400)
 
-        img = cv2.resize(img, (640, 640))
+        if img.shape[:2] != (640, 640):
+            img = cv2.resize(img, (640, 640))  # Keep consistent for YOLOv8
 
-        # Object count using contours
+        # Optional: Count objects to adjust YOLO confidence
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
         _, thresh = cv2.threshold(blur, 100, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         object_contours = [cnt for cnt in contours if cv2.contourArea(cnt) > 500]
         num_objects = len(object_contours)
-        logger.info(f"🧠 Object count detected via OpenCV: {num_objects}")
+        logger.info(f"🧠 Estimated object count: {num_objects}")
 
-        yolo_conf = 0.5 if num_objects == 1 else 0.002
-        results = model(img, imgsz=640, conf=yolo_conf)
+        # YOLO inference
+        conf = 0.5 if num_objects == 1 else 0.002
+        results = model(img, imgsz=640, conf=conf)
 
-        detected_ingredients = set()
-        for result in results:
-            classes = result.boxes.cls.cpu().numpy().astype(int)
-            names = result.names
-            for cls in classes:
-                detected_ingredients.add(names[cls])
+        detected = {
+            result.names[int(cls)]
+            for result in results
+            for cls in result.boxes.cls.cpu().numpy().astype(int)
+        }
 
-        logger.info(f"✅ Detected ingredients: {sorted(detected_ingredients)}")
+        logger.info(f"✅ Detected ingredients: {sorted(detected)}")
+        return {"detected_ingredients": sorted(detected)}
 
-        return {"detected_ingredients": sorted(detected_ingredients)}
+    except Exception as e:
+        logger.error(f"❌ Detection error: {e}")
+        return JSONResponse({"error": "Detection failed"}, status_code=500)
 
     finally:
         logger.info("🧹 Starting cleanup...")
-
         try:
             file.file.close()
         except Exception as e:
             logger.warning(f"File close error: {e}")
 
-        del file, contents, nparr, img, gray, blur, thresh, contours
-        gc.collect()
+        # Safe cleanup of all local variables
+        for var in ['contents', 'nparr', 'img', 'gray', 'blur', 'thresh', 'contours']:
+            try:
+                del globals()[var]
+            except:
+                pass
 
-        # Remove /tmp folders from Ultralytics
-        tmp_paths = glob.glob("/tmp/ultralytics*")
-        for path in tmp_paths:
+        # Clean Ultralytics temp folders
+        for path in glob.glob("/tmp/ultralytics*"):
             try:
                 if os.path.isdir(path):
                     shutil.rmtree(path)
-                    logger.info(f"🗑️ Deleted folder: {path}")
                 elif os.path.isfile(path):
                     os.remove(path)
-                    logger.info(f"🗑️ Deleted file: {path}")
             except Exception as e:
-                logger.warning(f"[Cleanup error] Failed to delete {path}: {e}")
+                logger.warning(f"Failed to delete {path}: {e}")
 
         # Log memory usage
-        process = psutil.Process(os.getpid())
-        mem = process.memory_info().rss / (1024 * 1024)
-        logger.info(f"📉 Memory after cleanup: {mem:.2f} MB")
-
-        # Clear model results
         try:
-            model.model = None
-            del results
+            mem = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+            logger.info(f"📉 Memory after cleanup: {mem:.2f} MB")
         except Exception as e:
-            logger.warning(f"Model cleanup failed: {e}")
+            logger.warning(f"Memory logging failed: {e}")
 
+        # Force GC
         gc.collect()
