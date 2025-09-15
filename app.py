@@ -1,4 +1,5 @@
 from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import JSONResponse
 from ultralytics import YOLO
 import cv2 as cv
 import numpy as np 
@@ -8,10 +9,12 @@ import os
 import tempfile
 
 
-app =  FastAPI()
+app = FastAPI()
 
+# Load model once at startup
 model = YOLO("best.onnx")
 print("Model Loaded Successfully")
+
 
 def read_image(uploaded_file: UploadFile):
     """Convert uploaded file to OpenCV image (BGR)."""
@@ -25,7 +28,7 @@ def read_image(uploaded_file: UploadFile):
 def detect_objects(img):
     original_img = img.copy()
 
-    # Using Cv to detect contours in detecting image
+    # Preprocess using contours
     gray = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
     blur = cv.GaussianBlur(gray, (7, 7), 0)
     _, thresh = cv.threshold(blur, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU)
@@ -40,7 +43,7 @@ def detect_objects(img):
     detected_any = False
     detection_count = 0
     detected_coords = []
-    detections = []  # making sure detections is in json format
+    detections = []
 
     for cnt in contours:
         x, y, w, h = cv.boundingRect(cnt)
@@ -72,7 +75,7 @@ def detect_objects(img):
                 abs_x2 = x1 + bx2
                 abs_y2 = y1 + by2
 
-                # Prevent duplicate detections
+                # Prevent duplicates
                 is_duplicate = any(
                     abs(abs_x1 - px1) < 20 and abs(abs_y1 - py1) < 20 and
                     abs(abs_x2 - px2) < 20 and abs(abs_y2 - py2) < 20
@@ -92,7 +95,7 @@ def detect_objects(img):
                 detection_count += 1
                 detected_coords.append((abs_x1, abs_y1, abs_x2, abs_y2))
 
-    # --- Step 3: Fallback if no detections ---
+    # --- Fallback if no detections ---
     if not detected_any:
         results = model.predict(original_img, conf=0.25, iou=0.45, verbose=False)
         for box in results[0].boxes:
@@ -114,27 +117,30 @@ def detect_objects(img):
 def root():
     return {"message": "Service is up and running!"}
 
+
 @app.post("/detect/")
 async def detect(file: UploadFile = File(...)):
+    temp_path = None
     try:
-        with tempfile.TemporaryFile(delete = False, suffix = "jpg") as tmp:
+        # Save to a temp file (Render allows ephemeral storage)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
             temp_path = tmp.name
             tmp.write(await file.read())
 
-        img = cv.imread(temp_path)   # convert to OpenCV
-        detections = detect_objects(img)  # run logic
-        ingredients = ({det["class"] for det in detections})
+        # Read with OpenCV
+        img = cv.imread(temp_path)
+        if img is None:
+            raise ValueError("Could not decode image")
 
-        return{"ingredients":ingredients}
+        detections = detect_objects(img)
+        ingredients = list({det["class"] for det in detections})
+
+        return {"ingredients": ingredients, "detections": detections}
+
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
-    
+
     finally:
-        if os.path.exists(temp_path):
+        if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
-            print(f"temporary file {temp_path} successfully deleted")
-        else:
-            print(f"Error:{temp_path} file not found")
-    
-
-
+            print(f"Temporary file {temp_path} deleted")
