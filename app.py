@@ -117,15 +117,15 @@ def root():
 @app.post("/detect/")
 async def detect(file: UploadFile = File(...)):
     try:
-       with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-           temp_path = tmp.name
-           tmp.write(await file.read())
+        contents = await file.read()
+        np_arr = np.frombuffer(contents, np.uint8)
+        img = cv.imdecode(np_arr, cv.IMREAD_COLOR)
 
-        img = cv.imread(temp_path)   # convert to OpenCV
-        detections = detect_objects(img)  # run logic
-        ingredients = ({det["class"] for det in detections})
+        detections = detect_objects(img)
+        ingredients = list({det["class"] for det in detections})
 
-        return{"ingredients":ingredients}
+        return {"ingredients": ingredients}
+
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
     
