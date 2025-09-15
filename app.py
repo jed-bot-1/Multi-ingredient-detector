@@ -117,6 +117,7 @@ def root():
 @app.post("/detect/")
 async def detect(file: UploadFile = File(...)):
     try:
+        # Read uploaded file into OpenCV image
         contents = await file.read()
         np_arr = np.frombuffer(contents, np.uint8)
         img = cv.imdecode(np_arr, cv.IMREAD_COLOR)
@@ -128,13 +129,3 @@ async def detect(file: UploadFile = File(...)):
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
-    
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-            print(f"temporary file {temp_path} successfully deleted")
-        else:
-            print(f"Error:{temp_path} file not found")
-    
-
-
