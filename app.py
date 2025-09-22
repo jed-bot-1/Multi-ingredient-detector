@@ -2,66 +2,49 @@ from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 from ultralytics import YOLO
 import cv2 as cv
-import numpy as np 
-import io
-from PIL import Image 
+import numpy as np
 import os
 import tempfile
 import gc
+import shutil
+import torch
 
 app = FastAPI()
 
-# Set higher NMS time limit before loading model
-os.environ['NMS_TIME_LIMIT'] = '10.0'  # Increase from 2.05 to 10 seconds
+# Increase NMS time limit
+os.environ['NMS_TIME_LIMIT'] = '10.0'
 
-# Load model with optimized settings
+# Load YOLO model
 model = YOLO("best.onnx", task='detect')
 print("Model Loaded Successfully")
 
 # Use GPU if available
-import torch
 if torch.cuda.is_available():
     model.to('cuda')
     print("Using GPU acceleration")
 
-def read_image(uploaded_file: UploadFile):
-    """Convert uploaded file to OpenCV image (BGR)."""
-    contents = uploaded_file.file.read()
-    pil_img = Image.open(io.BytesIO(contents)).convert("RGB")
-    img = np.array(pil_img)
-    img = cv.cvtColor(img, cv.COLOR_RGB2BGR)
-    return img
 
 def resize_image_maintain_aspect(img, target_size=640):
-    """Resize image to target size while maintaining aspect ratio"""
     height, width = img.shape[:2]
-    
-    # Calculate scaling factor
     scale = target_size / max(height, width)
     new_width = int(width * scale)
     new_height = int(height * scale)
-    
-    # Resize image
+
     resized_img = cv.resize(img, (new_width, new_height), interpolation=cv.INTER_AREA)
-    
-    # Create a 640x640 canvas with black background
     canvas = np.zeros((target_size, target_size, 3), dtype=np.uint8)
-    
-    # Calculate padding
+
     y_offset = (target_size - new_height) // 2
     x_offset = (target_size - new_width) // 2
-    
-    # Place resized image on canvas
     canvas[y_offset:y_offset+new_height, x_offset:x_offset+new_width] = resized_img
-    
+
     return canvas, scale, (x_offset, y_offset)
 
+
 def detect_objects(img):
-    # Resize to 640x640 for optimal model performance
+    # Your original detection logic is preserved
     resized_img, scale, (x_offset, y_offset) = resize_image_maintain_aspect(img)
     original_resized = resized_img.copy()
 
-    # Using Cv to detect contours on resized image
     gray = cv.cvtColor(resized_img, cv.COLOR_BGR2GRAY)
     blur = cv.GaussianBlur(gray, (7, 7), 0)
     _, thresh = cv.threshold(blur, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU)
@@ -92,7 +75,6 @@ def detect_objects(img):
         if roi.size == 0:
             continue
 
-        # Run YOLO on ROI - use 640x640 for optimal performance
         results = model.predict(roi, conf=0.25, iou=0.2, verbose=False)
         boxes = results[0].boxes
 
@@ -102,13 +84,11 @@ def detect_objects(img):
                 cls_id = int(box.cls[0])
                 conf = float(box.conf[0])
 
-                # Convert coordinates back to original image scale
                 abs_x1 = int((x1 + bx1 - x_offset) / scale)
                 abs_y1 = int((y1 + by1 - y_offset) / scale)
                 abs_x2 = int((x1 + bx2 - x_offset) / scale)
                 abs_y2 = int((y1 + by2 - y_offset) / scale)
 
-                # Prevent duplicate detections
                 is_duplicate = any(
                     abs(abs_x1 - px1) < 20 and abs(abs_y1 - py1) < 20 and
                     abs(abs_x2 - px2) < 20 and abs(abs_y2 - py2) < 20
@@ -127,16 +107,13 @@ def detect_objects(img):
                 detected_any = True
                 detected_coords.append((abs_x1, abs_y1, abs_x2, abs_y2))
 
-    # --- Step 3: Fallback if no detections ---
     if not detected_any:
-        # Run YOLO on full resized image (640x640 optimized)
         results = model.predict(resized_img, conf=0.25, iou=0.45, verbose=False)
         for box in results[0].boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             cls_id = int(box.cls[0])
             conf = float(box.conf[0])
 
-            # Convert coordinates back to original image scale
             abs_x1 = int((x1 - x_offset) / scale)
             abs_y1 = int((y1 - y_offset) / scale)
             abs_x2 = int((x2 - x_offset) / scale)
@@ -150,39 +127,43 @@ def detect_objects(img):
 
     return detections
 
+
 @app.get("/check")
 def root():
     return {"message": "Service is up and running!"}
 
+
 @app.post("/detect/")
 async def detect(file: UploadFile = File(...)):
+    temp_path = None
     try:
-        # Read uploaded file into OpenCV image
-        contents = await file.read()
-        np_arr = np.frombuffer(contents, np.uint8)
-        img = cv.imdecode(np_arr, cv.IMREAD_COLOR)
-        
-        # Detect objects with 640x640 optimized processing
+        # Save uploaded file to a temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+            shutil.copyfileobj(file.file, tmp)
+            temp_path = tmp.name
+
+        # Load image with OpenCV
+        img = cv.imread(temp_path)
         detections = detect_objects(img)
         ingredients = list({det["class"] for det in detections})
-
-        # Force cleanup
-        del contents, np_arr, img
-        gc.collect()
 
         return {"ingredients": ingredients}
 
     except Exception as e:
-        # Cleanup on error
-        if 'contents' in locals():
-            del contents
-        if 'np_arr' in locals():
-            del np_arr
-        if 'img' in locals():
-            del img
-        gc.collect()
-        
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+    finally:
+        # Always cleanup
+        try:
+            await file.close()
+        except:
+            pass
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
 
 @app.middleware("http")
 async def cleanup_after_request(request, call_next):
@@ -191,3 +172,5 @@ async def cleanup_after_request(request, call_next):
         return response
     finally:
         gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
