@@ -8,12 +8,16 @@ import os
 import psutil
 import logging
 from functools import lru_cache
+import asyncio
 
 # === CONFIG ===
 os.environ["YOLO_CONFIG_DIR"] = "/tmp"  # Prevent write issues on Render
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("detector")
+
+# Limit concurrent YOLO requests (Render free tier is weak)
+semaphore = asyncio.Semaphore(2)
 
 # === Load model once and cache ===
 @lru_cache(maxsize=1)
@@ -23,8 +27,11 @@ def get_model():
 model = get_model()
 
 
-@app.post("/detect/")
-async def detect(file: UploadFile = File(...)):
+async def run_detection(file: UploadFile):
+    contents = None
+    nparr = None
+    img = None
+    results = None
     try:
         logger.info("⏳ Received image, starting detection...")
 
@@ -53,7 +60,7 @@ async def detect(file: UploadFile = File(...)):
         num_objects = len(object_contours)
         logger.info(f"🧠 Estimated object count: {num_objects}")
 
-        # YOLO inference (limit conf to avoid overload)
+        # YOLO inference (lower conf if many objects)
         conf = 0.5 if num_objects <= 1 else 0.25
         results = model(img, imgsz=640, conf=conf)
 
@@ -77,8 +84,8 @@ async def detect(file: UploadFile = File(...)):
         except Exception as e:
             logger.warning(f"File close error: {e}")
 
-        # Clean local variables (safe way)
-        del contents, nparr, img, gray, blur, thresh, contours
+        # Clean memory
+        del contents, nparr, img, results
         gc.collect()
 
         # Log memory usage
@@ -87,3 +94,9 @@ async def detect(file: UploadFile = File(...)):
             logger.info(f"📉 Memory after cleanup: {mem:.2f} MB")
         except Exception as e:
             logger.warning(f"Memory logging failed: {e}")
+
+
+@app.post("/detect/")
+async def detect(file: UploadFile = File(...)):
+    async with semaphore:  # Limit concurrent YOLO calls
+        return await run_detection(file)
