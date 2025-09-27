@@ -1,14 +1,8 @@
-# Core
-fastapi==0.111.0
-uvicorn==0.30.1
-
-# Ultralytics + YOLO
-ultralytics==8.2.77
-
-# Inference runtime (CPU only)
-onnxruntime==1.18.0
-
-# Image processing
-numpy==1.26.4
-opencv-python==4.10.0.84
-Pillow==10.3.0
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+ultralytics==8.0.196
+opencv-python-headless==4.8.1.78
+pillow==10.1.0
+psutil==5.9.6
+gunicorn==21.2.0
+numpy==1.24.3
