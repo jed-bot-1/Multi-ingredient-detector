@@ -1,8 +1,5 @@
-from fastapi import FastAPI, File, UploadFile, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
-from ultralytics import YOLO
-import cv2
-import numpy as np
 import asyncio
 import gc
 import os
@@ -10,275 +7,231 @@ import psutil
 import logging
 from PIL import Image
 import io
-from concurrent.futures import ThreadPoolExecutor
 import tempfile
 import shutil
 
-# === RENDER DEPLOYMENT CONFIG ===
+# === RENDER OPTIMIZATION CONFIG ===
 os.environ["YOLO_CONFIG_DIR"] = "/tmp"
 os.environ["YOLO_VERBOSE"] = "False"
-os.environ["OMP_NUM_THREADS"] = "1"  # Single thread for starter tier
+os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
-app = FastAPI(title="Image Detection API", version="1.0.0")
-
-# Minimal logging for production
-logging.basicConfig(level=logging.WARNING)
+# Reduce logging to prevent memory issues
+logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger("detector")
 
-# === MEMORY-EFFICIENT MODEL MANAGER ===
-class OptimizedModelManager:
-    def __init__(self):
-        self._model = None
-        self._lock = asyncio.Lock()
-        self._loading = False
-    
-    async def get_model(self):
-        if self._model is None and not self._loading:
-            async with self._lock:
-                if self._model is None:  # Double-check pattern
-                    self._loading = True
-                    try:
-                        logger.warning("Loading YOLO model...")
-                        # Load with minimal memory footprint
-                        self._model = YOLO('best.onnx', task='detect')
-                        # Optimize for inference only
-                        self._model.overrides['verbose'] = False
-                        logger.warning("Model loaded successfully")
-                    except Exception as e:
-                        logger.error(f"Model loading failed: {e}")
-                        raise
-                    finally:
-                        self._loading = False
-        return self._model
-    
-    def is_loaded(self):
-        return self._model is not None
+app = FastAPI(title="Image Detection API", version="1.0.0")
 
-# Global instances
-model_manager = OptimizedModelManager()
-# Single worker for starter tier
-executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="yolo")
-
-# === MEMORY UTILITIES ===
-def force_cleanup():
-    """Aggressive memory cleanup"""
-    gc.collect()
-    gc.collect()  # Call twice for better cleanup
-    
-    # Clean YOLO temp files
-    try:
-        for temp_path in ["/tmp", tempfile.gettempdir()]:
-            for item in os.listdir(temp_path):
-                if "ultralytics" in item.lower() or "yolo" in item.lower():
-                    item_path = os.path.join(temp_path, item)
-                    try:
-                        if os.path.isfile(item_path):
-                            os.remove(item_path)
-                        elif os.path.isdir(item_path):
-                            shutil.rmtree(item_path)
-                    except:
-                        pass
-    except:
-        pass
+# Global model variable - lazy loaded
+_model = None
+_model_lock = asyncio.Lock()
 
 def get_memory_mb():
-    """Get current memory usage in MB"""
+    """Get current memory usage"""
     try:
         return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
     except:
         return 0
 
-# === OPTIMIZED DETECTION CORE ===
-def detect_ingredients_optimized(image_data: bytes) -> dict:
-    """Memory-optimized detection function"""
-    pil_image = None
-    cv_image = None
+def aggressive_cleanup():
+    """Force aggressive memory cleanup"""
+    gc.collect()
+    gc.collect()  # Call twice
     
+    # Clean temp files
     try:
-        # 1. Load image efficiently with PIL
-        pil_image = Image.open(io.BytesIO(image_data))
+        temp_dirs = ["/tmp", tempfile.gettempdir()]
+        for temp_dir in temp_dirs:
+            if os.path.exists(temp_dir):
+                for item in os.listdir(temp_dir):
+                    if any(x in item.lower() for x in ["ultralytics", "yolo", "onnx"]):
+                        item_path = os.path.join(temp_dir, item)
+                        try:
+                            if os.path.isfile(item_path):
+                                os.remove(item_path)
+                            elif os.path.isdir(item_path):
+                                shutil.rmtree(item_path)
+                        except:
+                            pass
+    except:
+        pass
+
+async def load_model():
+    """Load YOLO model with error handling"""
+    global _model
+    if _model is None:
+        async with _model_lock:
+            if _model is None:  # Double-check
+                try:
+                    # Import here to avoid startup issues
+                    from ultralytics import YOLO
+                    
+                    logger.error("Loading YOLO model...")
+                    _model = YOLO('best.onnx', task='detect')
+                    _model.overrides['verbose'] = False
+                    logger.error("Model loaded successfully")
+                    
+                    # Log memory after loading
+                    memory_mb = get_memory_mb()
+                    logger.error(f"Memory after model load: {memory_mb:.1f}MB")
+                    
+                except Exception as e:
+                    logger.error(f"Model loading failed: {e}")
+                    raise HTTPException(status_code=500, detail="Model loading failed")
+    return _model
+
+def detect_simple(image_bytes: bytes) -> dict:
+    """Simplified detection function"""
+    try:
+        # Check memory before processing
+        memory_before = get_memory_mb()
+        if memory_before > 450:
+            aggressive_cleanup()
         
-        # 2. Convert and resize in one step
-        if pil_image.mode != 'RGB':
-            pil_image = pil_image.convert('RGB')
+        # Load and process image
+        pil_img = Image.open(io.BytesIO(image_bytes))
         
-        # Resize only if needed
-        target_size = (640, 640)
-        if pil_image.size != target_size:
-            pil_image = pil_image.resize(target_size, Image.Resampling.LANCZOS)
+        # Convert to RGB and resize
+        if pil_img.mode != 'RGB':
+            pil_img = pil_img.convert('RGB')
         
-        # 3. Convert to numpy for YOLO
-        cv_image = np.array(pil_image)
+        if pil_img.size != (640, 640):
+            pil_img = pil_img.resize((640, 640), Image.Resampling.LANCZOS)
         
-        # 4. Quick object estimation for confidence tuning
-        gray = cv2.cvtColor(cv_image, cv2.COLOR_RGB2GRAY)
-        _, binary = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY)
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Convert to array
+        import numpy as np
+        img_array = np.array(pil_img)
         
-        # Count significant objects
-        significant_objects = sum(1 for c in contours if cv2.contourArea(c) > 400)
+        # Close PIL image immediately
+        pil_img.close()
+        del pil_img
         
-        # 5. YOLO inference with dynamic confidence
-        confidence = 0.45 if significant_objects <= 3 else 0.15
+        # Run YOLO inference
+        results = _model(img_array, imgsz=640, conf=0.25, verbose=False, device='cpu')
         
-        # Get model and run inference
-        model = model_manager._model
-        results = model(cv_image, imgsz=640, conf=confidence, verbose=False, device='cpu')
-        
-        # 6. Extract results efficiently
-        detected_classes = set()
+        # Extract results
+        detected = set()
         for result in results:
             if hasattr(result, 'boxes') and result.boxes is not None:
-                boxes = result.boxes
-                if len(boxes) > 0:
-                    class_ids = boxes.cls.cpu().numpy().astype(int)
+                if len(result.boxes) > 0:
+                    class_ids = result.boxes.cls.cpu().numpy().astype(int)
                     for class_id in class_ids:
-                        class_name = result.names[class_id]
-                        detected_classes.add(class_name)
+                        detected.add(result.names[class_id])
         
-        return {
-            "detected_ingredients": sorted(list(detected_classes)),
-            "count": len(detected_classes)
-        }
+        # Cleanup
+        del img_array
+        del results
+        del image_bytes
+        
+        return {"detected_ingredients": sorted(list(detected))}
     
     except Exception as e:
-        logger.error(f"Detection failed: {str(e)[:100]}")
-        return {"error": "Detection processing failed"}
+        logger.error(f"Detection error: {str(e)[:50]}")
+        return {"error": "Detection failed"}
     
     finally:
-        # Immediate cleanup
-        if pil_image:
-            pil_image.close()
-            del pil_image
-        if cv_image is not None:
-            del cv_image
-        if 'gray' in locals():
-            del gray
-        if 'binary' in locals():
-            del binary
-        del image_data
-        force_cleanup()
+        aggressive_cleanup()
 
-# === API ENDPOINTS ===
+@app.get("/")
+async def root():
+    """Simple root endpoint"""
+    memory_mb = get_memory_mb()
+    return {
+        "status": "running",
+        "memory_mb": round(memory_mb, 1)
+    }
+
+@app.get("/health/")
+async def health():
+    """Health check"""
+    memory_mb = get_memory_mb()
+    return {
+        "status": "healthy",
+        "memory_mb": round(memory_mb, 1),
+        "model_loaded": _model is not None
+    }
+
 @app.post("/detect/")
-async def detect_image(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    file_content = None
-    
+async def detect_endpoint(file: UploadFile = File(...)):
+    """Main detection endpoint"""
     try:
-        # Memory check before processing
-        current_memory = get_memory_mb()
-        if current_memory > 450:  # Leave buffer for 512MB limit
-            force_cleanup()
-            await asyncio.sleep(0.1)  # Brief pause
+        # Check memory first
+        memory_mb = get_memory_mb()
+        if memory_mb > 480:
+            aggressive_cleanup()
+            return JSONResponse({"error": "Memory limit reached"}, status_code=503)
         
-        # Validate file
-        if file.size and file.size > 8 * 1024 * 1024:  # 8MB limit
-            return JSONResponse({"error": "Image too large (max 8MB)"}, status_code=413)
+        # Validate file size
+        if file.size and file.size > 5 * 1024 * 1024:  # 5MB limit
+            return JSONResponse({"error": "File too large"}, status_code=413)
         
         # Read file
         file_content = await file.read()
         
-        # Quick format validation
-        if len(file_content) < 100:  # Too small to be valid image
-            return JSONResponse({"error": "Invalid image file"}, status_code=400)
+        # Validate image
+        try:
+            Image.open(io.BytesIO(file_content)).verify()
+        except:
+            return JSONResponse({"error": "Invalid image"}, status_code=400)
         
-        # Ensure model is ready
-        await model_manager.get_model()
+        # Load model if needed
+        await load_model()
         
-        # Run detection in thread pool
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            executor, 
-            detect_ingredients_optimized, 
-            file_content
-        )
+        # Run detection in a way that doesn't block too long
+        try:
+            # Add timeout to prevent hanging
+            result = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None, detect_simple, file_content
+                ),
+                timeout=30.0  # 30 second timeout
+            )
+        except asyncio.TimeoutError:
+            return JSONResponse({"error": "Detection timeout"}, status_code=408)
         
-        # Schedule background cleanup
-        background_tasks.add_task(cleanup_background)
-        
-        # Handle errors
         if "error" in result:
             return JSONResponse(result, status_code=500)
         
         return JSONResponse(result)
     
     except Exception as e:
-        logger.error(f"API error: {str(e)[:100]}")
+        logger.error(f"Endpoint error: {str(e)[:50]}")
         return JSONResponse({"error": "Processing failed"}, status_code=500)
     
     finally:
-        if file_content:
-            del file_content
-        force_cleanup()
+        # Final cleanup
+        aggressive_cleanup()
 
-async def cleanup_background():
-    """Background cleanup task"""
-    await asyncio.sleep(0.5)
-    force_cleanup()
-
-@app.get("/health/")
-async def health_check():
-    """Health and status endpoint"""
-    memory_mb = get_memory_mb()
-    return {
-        "status": "healthy" if memory_mb < 500 else "warning",
-        "memory_mb": round(memory_mb, 1),
-        "memory_percent": round((memory_mb / 512) * 100, 1),
-        "model_loaded": model_manager.is_loaded()
-    }
-
-@app.get("/")
-async def root():
-    """Root endpoint"""
-    return {
-        "service": "Image Detection API", 
-        "status": "running",
-        "memory_mb": round(get_memory_mb(), 1)
-    }
-
-# === STARTUP/SHUTDOWN HANDLERS ===
 @app.on_event("startup")
-async def startup_event():
-    """Initialize service"""
-    try:
-        logger.warning("Starting Image Detection API...")
-        # Preload model to avoid first-request delay
-        await model_manager.get_model()
-        initial_memory = get_memory_mb()
-        logger.warning(f"Startup complete. Memory: {initial_memory:.1f}MB")
-    except Exception as e:
-        logger.error(f"Startup failed: {e}")
-        raise
+async def startup():
+    """Minimal startup"""
+    logger.error("API starting...")
+    # Don't preload model - load on first request instead
 
-@app.on_event("shutdown")
-async def shutdown_event():
+@app.on_event("shutdown") 
+async def shutdown():
     """Cleanup on shutdown"""
-    logger.warning("Shutting down...")
-    executor.shutdown(wait=False)
-    force_cleanup()
+    aggressive_cleanup()
 
-# === MIDDLEWARE FOR MEMORY MONITORING ===
+# Memory monitoring middleware
 @app.middleware("http")
-async def memory_middleware(request, call_next):
-    """Monitor memory usage per request"""
+async def monitor_memory(request, call_next):
+    """Monitor and limit memory usage"""
+    memory_before = get_memory_mb()
     
-    # Process request
+    # If memory is too high, force cleanup
+    if memory_before > 480:
+        aggressive_cleanup()
+        # If still too high after cleanup, reject request
+        if get_memory_mb() > 500:
+            return JSONResponse({"error": "Service overloaded"}, status_code=503)
+    
     response = await call_next(request)
     
-    # Check memory after request
+    # Cleanup after request
     memory_after = get_memory_mb()
-    if memory_after > 480:  # Near limit
-        force_cleanup()
+    if memory_after > 450:
+        aggressive_cleanup()
     
     return response
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=int(os.environ.get("PORT", 8000)),
-        workers=1
-    )
